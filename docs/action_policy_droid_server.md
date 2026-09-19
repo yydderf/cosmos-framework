@@ -54,6 +54,7 @@ docker run \
   -v .:/workspace \
   -v /workspace/.venv \
   -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+  -v $HOME/.cache/uv:/root/.cache/uv \
   cosmos-framework:latest \
   bash -c '\
     uv sync \
