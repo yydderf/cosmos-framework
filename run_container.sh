@@ -2,6 +2,7 @@
     -it \
     -e HF_HOME=/workspace/.cache/huggingface \
     -e HF_TOKEN=$HF_TOKEN \
+    --name cosmos3_policy_server \
     --net host \
     --rm \
     --runtime nvidia \

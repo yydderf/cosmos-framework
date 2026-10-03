@@ -86,6 +86,15 @@ _ROBOLAB_POLICY_HF_REPOSITORIES = {
 
 ActionSpace = Literal["joint_pos", "midtrain"]
 
+def nsys_profile(func):
+    def wrapper(*args, **kwargs):
+        torch.cuda.synchronize()
+        torch.cuda.profiler.start()
+        out = func(*args, **kwargs)
+        torch.cuda.profiler.stop()
+        torch.cuda.synchronize()
+        return out
+    return wrapper
 
 def _load_checkpoint_metadata(checkpoint_path: str) -> dict[str, Any] | None:
     if "://" in checkpoint_path:
@@ -575,11 +584,13 @@ class RobolabPolicyService:
         }
         if history_action is not None:
             sample["history_action"] = history_action
-        sample = self._transform(sample, self.cfg.resolution)
+        with torch.cuda.nvtx.range("Input Transformation"):
+            sample = self._transform(sample, self.cfg.resolution)
         if isinstance(sample.get("ai_caption"), dict):
             sample["ai_caption"] = json.dumps(sample["ai_caption"])
         return sample
 
+    @nsys_profile
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
         start_time = time.monotonic()
         sample = self._build_sample(obs)
@@ -587,18 +598,19 @@ class RobolabPolicyService:
         seed = self._next_seed()
         log.info(f"[robolab-policy-server] prompt={data_batch['ai_caption'][0]!r} seed={seed}")
 
-        with self._lock:
-            with torch.inference_mode():
-                samples = self.model.generate_samples_from_batch(
-                    data_batch,
-                    guidance=self.cfg.guidance,
-                    guidance_interval=(
-                        list(self.cfg.guidance_interval) if self.cfg.guidance_interval is not None else None
-                    ),
-                    seed=[seed],
-                    num_steps=self.cfg.num_steps,
-                    shift=self.cfg.shift,
-                )
+        with torch.cuda.nvtx.range("Sample Generation"):
+            with self._lock:
+                with torch.inference_mode():
+                    samples = self.model.generate_samples_from_batch(
+                        data_batch,
+                        guidance=self.cfg.guidance,
+                        guidance_interval=(
+                            list(self.cfg.guidance_interval) if self.cfg.guidance_interval is not None else None
+                        ),
+                        seed=[seed],
+                        num_steps=self.cfg.num_steps,
+                        shift=self.cfg.shift,
+                    )
 
         action = samples["action"][0][:, : self.cfg.action_dim]  # [T,D]
         action = action[self.cfg.history_length :]  # [T2,D]
@@ -633,7 +645,6 @@ class RobolabPolicyService:
         if os.environ.get("EVAL_VERBOSE"):
             print(f"infer_ms: {infer_ms:.1f}")
         return outputs
-
 
 def serve(args: RobolabServerArgs) -> None:
     hostname = socket.gethostname()
