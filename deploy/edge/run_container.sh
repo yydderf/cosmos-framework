@@ -1,3 +1,5 @@
+#!/bin/bash
+
 docker run -it --rm \
   --name cosmos3_policy_server \
   --net host --runtime nvidia --cap-add=SYS_ADMIN \
@@ -8,6 +10,7 @@ docker run -it --rm \
   -v /workspace/.venv \
   -v uv-cache:/root/.cache/uv \
   -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+  --entrypoint /workspace/deploy/edge/entrypoint.sh \
   cosmos-framework:latest \
   bash -c '\
     uv sync \

@@ -10,7 +10,7 @@
 COSMOS_DIST_BACKEND=gloo \
 MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader | tr ' ' '-') \
 POLICY=cosmos3 DATETIME=$(date +"%Y%m%d_%H%M") \
-    /opt/nsight/bin/nsys profile \
+    nsys profile \
     --output /workspace/outputs/nsys/%q{MODEL}_%q{POLICY}_%q{DATETIME}_%p --force-overwrite=true \
     --trace=cuda,nvtx,cublas,cudnn,osrt \
     --gpu-metrics-devices=cuda-visible \
