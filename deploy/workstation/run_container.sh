@@ -12,6 +12,7 @@
     -v /workspace/.venv \
     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
     -v $HOME/.cache/uv:/root/.cache/uv \
+    --entrypoint /workspace/deploy/workstation/entrypoint.sh \
     cosmos-framework:latest \
     bash -c '\
       uv sync \

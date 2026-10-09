@@ -63,7 +63,7 @@ def maybe_init_distributed() -> None:
     rank_env = os.getenv("RANK")
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    backend = os.getenv("COSMOS_DIST_BACKEND") or ("nccl" if torch.cuda.is_available() else "gloo")
 
     if world_size_env is not None and rank_env is not None:
         if torch.cuda.is_available():
