@@ -11,6 +11,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
 from cosmos_framework.utils import log
+from cosmos_framework.utils.nvtx import nvtx_phase, nvtx_pop, nvtx_push
 from cosmos_framework.configs.base.defaults.joint_attention import packing_layout
 from cosmos_framework.configs.base.defaults.multiview_attention import (
     MultiviewAttentionConfig,
@@ -1315,26 +1316,36 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # This is intentional for proper batch norm / dropout behavior
         # assert self.training, "Cosmos3VFMNetwork only supports training mode"
 
-        packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
+        # NVTX note: _encode_text/_encode_vision/_encode_action and their decode
+        # counterparts are torch.compile'd in parallelize_vfm_network.apply_compile, so the
+        # ranges have to sit here at the call sites -- a range inside those bodies would be
+        # traced away rather than emitted.
+        with nvtx_phase("fwd.encode_text"):
+            packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
 
         # encode vision tokens
         original_latent_shapes: List[Tuple[int, int, int]] | None = None
         original_latent_shapes_lidar: List[Tuple[int, int, int]] | None = None
         if self.config.vision_gen:
-            original_latent_shapes = self._encode_vision(packed_seq, packed_sequence, target_dtype)
+            with nvtx_phase("fwd.encode_vision"):
+                original_latent_shapes = self._encode_vision(packed_seq, packed_sequence, target_dtype)
 
         # encode lidar tokens
         if self.lidar_gen:
-            original_latent_shapes_lidar = self._encode_lidar(packed_seq, packed_sequence, target_dtype)
+            with nvtx_phase("fwd.encode_lidar"):
+                original_latent_shapes_lidar = self._encode_lidar(packed_seq, packed_sequence, target_dtype)
 
         # encode action tokens
         if self.config.action_gen:
-            self._encode_action(packed_seq, packed_sequence, target_dtype)
+            with nvtx_phase("fwd.encode_action"):
+                self._encode_action(packed_seq, packed_sequence, target_dtype)
 
         # encode sound tokens
         if self.config.sound_gen:
-            self._encode_sound(packed_seq, packed_sequence, target_dtype)
+            with nvtx_phase("fwd.encode_sound"):
+                self._encode_sound(packed_seq, packed_sequence, target_dtype)
 
+        nvtx_push("fwd.token_prep")
         assert packed_seq.attn_modes is not None
         assert packed_seq.split_lens is not None
         use_video_temporal_causal = (
@@ -1395,7 +1406,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             1 if replicated_attention_io_cp else (self.parallel_dims.cp_size if self.parallel_dims else 1)
         )
         prepared_sequence_pack_metadata = packed_seq.get_sequence_pack_metadata()
+        nvtx_pop()  # fwd.token_prep
 
+        nvtx_push("fwd.pack")
         input_pack, attention_meta, natten_metadata_list = build_packed_sequence(
             # The pack shape, not the pathway: "multiview" lays a pack down exactly as "two_way"
             # does, and the packer knows only the two shapes.
@@ -1434,7 +1447,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # after the decode, so without the ``del`` a full-sequence ``[N_total,hidden_size]`` buffer
         # stays live across the entire transformer for nothing.
         del packed_sequence
+        nvtx_pop()  # fwd.pack
 
+        nvtx_push("fwd.attn_prep")
         # Keep multiview preparation in a separate frame. Mask construction temporarily aliases
         # the full padded hidden-state streams; those aliases must leave scope before input_pack is
         # replaced by its cloned CP-local pack, or they will pin the full backing allocations
@@ -1479,36 +1494,47 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             position_ids=packed_seq.position_ids,
             parallel_dims=sequence_shard_parallel_dims,
         )
+        nvtx_pop()  # fwd.attn_prep
 
-        packed_outputs, lbl_metadata = self.language_model(
-            input_pack,
-            attention_mask=attention_meta,
-            position_ids=packed_position_ids,
-            natten_metadata_list=natten_metadata_list,
-            memory=memory,
-        )
-        last_hidden_state = get_context_parallel_last_hidden_state(
-            packed_outputs=packed_outputs,
-            parallel_dims=sequence_shard_parallel_dims,
-            correct_cp_gradients=correct_cp_gradients,
-        )  # [N_total,hidden_size]
+        # The MoT decoder stack, and normally the bulk of a denoising step. Each layer is
+        # separately torch.compile'd (and CUDA-graphed under reduce-overhead), so this is
+        # as fine-grained as NVTX can see inside the stack. DiffusionCache patches
+        # language_model.forward, and on a cache hit this range is near-empty by design.
+        with nvtx_phase("fwd.mot_stack"):
+            packed_outputs, lbl_metadata = self.language_model(
+                input_pack,
+                attention_mask=attention_meta,
+                position_ids=packed_position_ids,
+                natten_metadata_list=natten_metadata_list,
+                memory=memory,
+            )
+        with nvtx_phase("fwd.cp_gather"):
+            last_hidden_state = get_context_parallel_last_hidden_state(
+                packed_outputs=packed_outputs,
+                parallel_dims=sequence_shard_parallel_dims,
+                correct_cp_gradients=correct_cp_gradients,
+            )  # [N_total,hidden_size]
         output_dict = dict()
 
         # decode vision tokens
         if self.config.vision_gen:
-            self._decode_vision(packed_seq, last_hidden_state, output_dict, original_latent_shapes)
+            with nvtx_phase("fwd.decode_vision"):
+                self._decode_vision(packed_seq, last_hidden_state, output_dict, original_latent_shapes)
 
         # decode lidar tokens
         if self.lidar_gen:
-            self._decode_lidar(packed_seq, last_hidden_state, output_dict, original_latent_shapes_lidar)
+            with nvtx_phase("fwd.decode_lidar"):
+                self._decode_lidar(packed_seq, last_hidden_state, output_dict, original_latent_shapes_lidar)
 
         # decode action tokens
         if self.config.action_gen:
-            self._decode_action(packed_seq, last_hidden_state, output_dict)
+            with nvtx_phase("fwd.decode_action"):
+                self._decode_action(packed_seq, last_hidden_state, output_dict)
 
         # decode sound tokens
         if self.config.sound_gen:
-            self._decode_sound(packed_seq, last_hidden_state, output_dict)
+            with nvtx_phase("fwd.decode_sound"):
+                self._decode_sound(packed_seq, last_hidden_state, output_dict)
 
         output_dict.update(last_hidden_state=last_hidden_state)
         for lbl_metadata_key, lbl_metadata_value in lbl_metadata.items():

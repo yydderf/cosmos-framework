@@ -8,6 +8,7 @@ import attrs
 import torch
 
 from cosmos_framework.utils.config import make_freezable
+from cosmos_framework.utils.nvtx import nvtx_phase
 from cosmos_framework.utils.progress_bar import progress_bar
 from cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from cosmos_framework.model.generator.diffusion.samplers.utils import run_multiseed
@@ -85,7 +86,8 @@ class UniPCSampler(torch.nn.Module):
         for step_index, timestep in enumerate(progress_bar(timesteps, desc="Sampling", total=len(timesteps))):
             if step_callback is not None:
                 step_callback(step_index, len(timesteps))
-            velocity_pred = velocity_fn(latent, timestep.reshape(1, 1))
+            with nvtx_phase("sampler.velocity"):
+                velocity_pred = velocity_fn(latent, timestep.reshape(1, 1))
 
             def _scheduler_step(
                 seed_g: torch.Generator,
@@ -105,12 +107,13 @@ class UniPCSampler(torch.nn.Module):
                     generator=seed_g,
                 )[0].squeeze(0)
 
-            latent = run_multiseed(
-                _scheduler_step,
-                seed_g=seed_g,
-                sample_scheduler=sample_scheduler,
-                velocity_pred=velocity_pred,
-                latent=latent,
-            )
+            with nvtx_phase("sampler.scheduler_update"):
+                latent = run_multiseed(
+                    _scheduler_step,
+                    seed_g=seed_g,
+                    sample_scheduler=sample_scheduler,
+                    velocity_pred=velocity_pred,
+                    latent=latent,
+                )
 
         return latent

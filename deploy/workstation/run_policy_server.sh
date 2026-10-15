@@ -7,6 +7,7 @@
 #   --num-steps 10
 #
 # RTX3090 graphics processor uses the GA102 architecture (--gpu-metrics-set=ga102)
+COSMOS_NVTX=1 COSMOS_NSYS_WARMUP=3 \
 MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader | tr ' ' '-') \
 POLICY=cosmos3 DATETIME=$(date +"%Y%m%d_%H%M") \
     nsys profile \

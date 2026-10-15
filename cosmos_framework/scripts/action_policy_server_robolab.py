@@ -25,6 +25,7 @@ from cosmos_framework.inference.common.init import init_script
 
 init_script()
 
+import functools
 import json
 import os
 import socket
@@ -63,6 +64,7 @@ from cosmos_framework.scripts.action_policy_server_utils import (
 from cosmos_framework.utils import log
 from cosmos_framework.utils.checkpoint_db import CheckpointDirHf
 from cosmos_framework.utils.lazy_config import instantiate
+from cosmos_framework.utils.nvtx import nvtx_phase
 
 _DEFAULT_DROID_POLICY_CHECKPOINT = "nvidia/Cosmos3-Nano-Policy-DROID"
 _DEFAULT_CONDITIONING_FPS = 15.0
@@ -86,14 +88,39 @@ _ROBOLAB_POLICY_HF_REPOSITORIES = {
 
 ActionSpace = Literal["joint_pos", "midtrain"]
 
+# Requests captured once the warmup budget is spent. Two windows matches
+# ``--capture-range-end=repeat:2`` in deploy/*/run_policy_server.sh, so nsys shuts the
+# session down exactly when this stops opening ranges.
+_NSYS_CAPTURE_REQUESTS = 2
+
+
 def nsys_profile(func):
+    """Open a cudaProfilerApi capture range around the first warm requests.
+
+    Capturing from request 0 would profile torch.compile, Inductor autotuning and
+    CUDA-graph capture rather than inference, so the window is delayed by
+    ``COSMOS_NSYS_WARMUP`` requests (default 10). Outside the window the wrapper does
+    nothing at all -- in particular it skips ``torch.cuda.synchronize()``, which would
+    otherwise be a permanent per-request latency cost on a server that is profiled once.
+    """
+    warmup = int(os.environ.get("COSMOS_NSYS_WARMUP", "10"))
+    state = {"count": 0}
+
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        index = state["count"]
+        state["count"] = index + 1
+        if not warmup <= index < warmup + _NSYS_CAPTURE_REQUESTS:
+            return func(*args, **kwargs)
+
         torch.cuda.synchronize()
         torch.cuda.profiler.start()
-        out = func(*args, **kwargs)
-        torch.cuda.profiler.stop()
-        torch.cuda.synchronize()
-        return out
+        try:
+            return func(*args, **kwargs)
+        finally:
+            torch.cuda.profiler.stop()
+            torch.cuda.synchronize()
+
     return wrapper
 
 def _load_checkpoint_metadata(checkpoint_path: str) -> dict[str, Any] | None:
@@ -584,7 +611,7 @@ class RobolabPolicyService:
         }
         if history_action is not None:
             sample["history_action"] = history_action
-        with torch.cuda.nvtx.range("Input Transformation"):
+        with nvtx_phase("Input Transformation"):
             sample = self._transform(sample, self.cfg.resolution)
         if isinstance(sample.get("ai_caption"), dict):
             sample["ai_caption"] = json.dumps(sample["ai_caption"])
@@ -593,12 +620,14 @@ class RobolabPolicyService:
     @nsys_profile
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
         start_time = time.monotonic()
-        sample = self._build_sample(obs)
-        data_batch = _build_data_batch_from_sample(sample)
+        with nvtx_phase("Build Sample"):
+            sample = self._build_sample(obs)
+        with nvtx_phase("Build Data Batch"):
+            data_batch = _build_data_batch_from_sample(sample)
         seed = self._next_seed()
         log.info(f"[robolab-policy-server] prompt={data_batch['ai_caption'][0]!r} seed={seed}")
 
-        with torch.cuda.nvtx.range("Sample Generation"):
+        with nvtx_phase("Sample Generation"):
             with self._lock:
                 with torch.inference_mode():
                     samples = self.model.generate_samples_from_batch(
@@ -612,33 +641,37 @@ class RobolabPolicyService:
                         shift=self.cfg.shift,
                     )
 
-        action = samples["action"][0][:, : self.cfg.action_dim]  # [T,D]
-        action = action[self.cfg.history_length :]  # [T2,D]
-        action_np = action.detach().cpu().numpy()  # [T2,D]
-        action_np[:, -1] = 1.0 - action_np[:, -1]
+        # Holds the device->host sync on the generated chunk, so it reads as GPU-idle
+        # on the timeline even though the cost is the transfer, not the numpy work.
+        with nvtx_phase("Action Postprocess"):
+            action = samples["action"][0][:, : self.cfg.action_dim]  # [T,D]
+            action = action[self.cfg.history_length :]  # [T2,D]
+            action_np = action.detach().cpu().numpy()  # [T2,D]
+            action_np[:, -1] = 1.0 - action_np[:, -1]
 
-        if self.cfg.action_space == "midtrain":
-            eef_pos = _ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3)
-            eef_quat = _ensure_2d_float_array(obs["observation/eef_quat"], "observation/eef_quat", 4)
-            initial_pose = np.eye(4, dtype=np.float32)
-            initial_pose[:3, :3] = convert_rotation(eef_quat[-1], "quat_xyzw", "matrix")
-            initial_pose[:3, 3] = eef_pos[-1]
-            abs_pose = pose_rel_to_abs(
-                action_np[:, :9],
-                rotation_format="rot6d",
-                pose_convention="backward_framewise",
-                initial_pose=initial_pose,
-            )
-            position = abs_pose[1:, :3, 3]
-            quat_xyzw = convert_rotation(abs_pose[1:, :3, :3], "matrix", "quat_xyzw")
-            action_np = np.concatenate([position, quat_xyzw, action_np[:, 9:]], axis=-1)
+            if self.cfg.action_space == "midtrain":
+                eef_pos = _ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3)
+                eef_quat = _ensure_2d_float_array(obs["observation/eef_quat"], "observation/eef_quat", 4)
+                initial_pose = np.eye(4, dtype=np.float32)
+                initial_pose[:3, :3] = convert_rotation(eef_quat[-1], "quat_xyzw", "matrix")
+                initial_pose[:3, 3] = eef_pos[-1]
+                abs_pose = pose_rel_to_abs(
+                    action_np[:, :9],
+                    rotation_format="rot6d",
+                    pose_convention="backward_framewise",
+                    initial_pose=initial_pose,
+                )
+                position = abs_pose[1:, :3, 3]
+                quat_xyzw = convert_rotation(abs_pose[1:, :3, :3], "matrix", "quat_xyzw")
+                action_np = np.concatenate([position, quat_xyzw, action_np[:, 9:]], axis=-1)
 
         outputs: dict[str, Any] = {"action": action_np}
         if self.cfg.decode_video:
-            pred_vision_latent = samples["vision"][0]  # [C,T,H,W]
-            video = self.model.decode(pred_vision_latent)  # [1,C,T,H,W]
-            video = ((video[0].clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 3, 0)  # [T,H,W,3]
-            outputs["video"] = video.detach().cpu().numpy()
+            with nvtx_phase("Decode Video"):
+                pred_vision_latent = samples["vision"][0]  # [C,T,H,W]
+                video = self.model.decode(pred_vision_latent)  # [1,C,T,H,W]
+                video = ((video[0].clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 3, 0)  # [T,H,W,3]
+                outputs["video"] = video.detach().cpu().numpy()
 
         infer_time = time.monotonic() - start_time
         infer_ms = infer_time * 1000.0

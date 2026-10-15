@@ -1,7 +1,6 @@
   docker run \
     -it \
-    -e HF_HOME=/workspace/.cache/huggingface \
-    -e HF_TOKEN=$HF_TOKEN \
+    -e HF_TOKEN=$HF_TOKEN -e HF_HUB_OFFLINE=1 \
     --name cosmos3_policy_server \
     --net host \
     --rm \
@@ -10,7 +9,7 @@
     -v /opt/nvidia/nsight-systems/2026.4.1/target-linux-x64:/opt/nsight/target-linux-x64:ro \
     -v .:/workspace \
     -v /workspace/.venv \
-    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -v /srv/models/huggingface:/root/.cache/huggingface \
     -v $HOME/.cache/uv:/root/.cache/uv \
     --entrypoint /workspace/deploy/workstation/entrypoint.sh \
     cosmos-framework:latest \

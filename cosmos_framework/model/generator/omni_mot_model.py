@@ -27,6 +27,7 @@ from cosmos_framework.utils.lazy_config.registry import locate
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import log, misc
 from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.nvtx import nvtx_phase, nvtx_pop, nvtx_push
 from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
     ACTION_SLOT_SAMPLE_COUNT_KEY,
     ACTION_SLOT_SAMPLE_LOSS_KEY,
@@ -2550,11 +2551,12 @@ class OmniMoTModel(ImaginaireModel):
                   flat state identically.
         """
         # 1. Build sequence plans (same as training)
-        sequence_plans = build_sequence_plans_from_data_batch(
-            data_batch=data_batch,
-            input_video_key=self.input_video_key,
-            input_image_key=self.input_image_key,
-        )
+        with nvtx_phase("prep.plans"):
+            sequence_plans = build_sequence_plans_from_data_batch(
+                data_batch=data_batch,
+                input_video_key=self.input_video_key,
+                input_image_key=self.input_image_key,
+            )
 
         # 2. Get data and condition (same as training)
         # This encodes vision to x0_tokens. Pass each sample's vision conditioning
@@ -2562,21 +2564,22 @@ class OmniMoTModel(ImaginaireModel):
         # feed generated (non-conditioned) latent positions (e.g. WAM /
         # forward-dynamics condition latent frame 0 only, so only the first pixel frame
         # is encoded instead of the whole clip).
-        vision_condition_indexes = [plan.condition_frame_indexes_vision for plan in sequence_plans]
-        per_camera_vae_encoding = "enable_per_camera_vae_encoding" in data_batch
-        gen_data_clean = self.get_data_and_condition(
-            data_batch,
-            vision_condition_indexes=vision_condition_indexes,
-            retain_raw_state_vision=not per_camera_vae_encoding,
-        )
-        if gen_data_clean.num_views_per_vision_item is None:
-            gen_data_clean.num_views_per_vision_item = self._get_explicit_single_view_metadata(
+        with nvtx_phase("prep.vae_encode"):
+            vision_condition_indexes = [plan.condition_frame_indexes_vision for plan in sequence_plans]
+            per_camera_vae_encoding = "enable_per_camera_vae_encoding" in data_batch
+            gen_data_clean = self.get_data_and_condition(
                 data_batch,
-                gen_data_clean.num_vision_items_per_sample,
-                gen_data_clean.batch_size,
+                vision_condition_indexes=vision_condition_indexes,
+                retain_raw_state_vision=not per_camera_vae_encoding,
             )
+            if gen_data_clean.num_views_per_vision_item is None:
+                gen_data_clean.num_views_per_vision_item = self._get_explicit_single_view_metadata(
+                    data_batch,
+                    gen_data_clean.num_vision_items_per_sample,
+                    gen_data_clean.batch_size,
+                )
 
-        self._release_inference_raw_vision(data_batch, gen_data_clean)
+            self._release_inference_raw_vision(data_batch, gen_data_clean)
 
         num_items_per_sample = gen_data_clean.num_vision_items_per_sample  # None for standard T2I/T2V
 
@@ -2584,23 +2587,28 @@ class OmniMoTModel(ImaginaireModel):
         # Read the caption layout off the captions this call actually packs, and record it on
         # the plans before packing, so a per-view batch keeps one caption per camera here the
         # way training does instead of collapsing to a single sample-level prompt.
-        caption_groups = _per_view_caption_groups(data_batch[self.input_caption_key])
-        self._apply_inference_caption_plan(sequence_plans, caption_groups)
-        cond_text_tokens, uncond_text_tokens = self._get_inference_text_tokens(
-            data_batch, has_negative_prompt, caption_groups
-        )
+        with nvtx_phase("prep.tokenize"):
+            caption_groups = _per_view_caption_groups(data_batch[self.input_caption_key])
+            self._apply_inference_caption_plan(sequence_plans, caption_groups)
+            cond_text_tokens, uncond_text_tokens = self._get_inference_text_tokens(
+                data_batch, has_negative_prompt, caption_groups
+            )
 
         # 4. Build packed sequence to fetch conditioning masks
-        mask_timesteps = torch.zeros((gen_data_clean.batch_size,), dtype=torch.float32)  # [B]
-        packed_sequence = self._pack_input_sequence(
-            sequence_plans,
-            cond_text_tokens,
-            gen_data_clean,
-            mask_timesteps,
-            include_end_of_generation_token=self._derive_include_end_of_generation_token(),
-        )
+        with nvtx_phase("prep.pack_masks"):
+            mask_timesteps = torch.zeros((gen_data_clean.batch_size,), dtype=torch.float32)  # [B]
+            packed_sequence = self._pack_input_sequence(
+                sequence_plans,
+                cond_text_tokens,
+                gen_data_clean,
+                mask_timesteps,
+                include_end_of_generation_token=self._derive_include_end_of_generation_token(),
+            )
 
         # 5. Initialize vision noise with conditioning
+        # Straight-line through the return below, so the push/pop pair is safe here;
+        # wrapping it would mean reindenting the whole noise-assembly body.
+        nvtx_push("prep.noise")
         condition_mask_vision = _vision_condition_masks(packed_sequence)
         assert gen_data_clean.x0_tokens_vision is not None, "Vision data required for inference noise"
         n_sample = (
@@ -2822,6 +2830,7 @@ class OmniMoTModel(ImaginaireModel):
             condition_reference.append(torch.cat(condition_reference_parts, dim=0))  # [N_tokens_flat]
             condition_mask.append(torch.cat(condition_mask_parts, dim=0))  # [N_tokens_flat]
 
+        nvtx_pop()  # prep.noise
         return (
             sequence_plans,
             gen_data_clean,
@@ -3047,6 +3056,7 @@ class OmniMoTModel(ImaginaireModel):
         # Split flattened noise_x into vision, LiDAR, action, and sound parts per sample
         # Order must match _prepare_inference_data:
         # [vision | lidar (if present) | action (if present) | sound (if present)]
+        nvtx_push("vel.noise_split")
         noise_x_vision: list[torch.Tensor] = []
         noise_x_lidar: list[torch.Tensor] | None = [] if has_lidar else None
         noise_x_action: list[torch.Tensor] | None = [] if has_noisy_actions else None
@@ -3095,6 +3105,8 @@ class OmniMoTModel(ImaginaireModel):
                 offset += sound_dim
                 idx_sound += 1
 
+        nvtx_pop()  # vel.noise_split
+
         if has_action:
             if has_noisy_actions:
                 x0_action_tokens = noise_x_action
@@ -3135,6 +3147,10 @@ class OmniMoTModel(ImaginaireModel):
             control_weights=gen_data_clean.control_weights,
         )
 
+        # Two very different costs share this range: a full repack on the first step (or
+        # whenever templates are ineligible) versus a token/timestep refresh on the reuse
+        # fast path. Comparing the range across steps is what shows whether reuse engaged.
+        nvtx_push("vel.pack")
         if packed_sequence_template is None:
             packed_sequence = self._pack_input_sequence(
                 sequence_plans,
@@ -3172,13 +3188,15 @@ class OmniMoTModel(ImaginaireModel):
                 noise_x_sound,
                 timestep,
             )
+        nvtx_pop()  # vel.pack
 
         # --- Network forward ---
-        out = self.denoise(
-            net=net,
-            data_batch_packed=packed_sequence,
-            memory=memory,
-        )
+        with nvtx_phase("vel.denoise"):
+            out = self.denoise(
+                net=net,
+                data_batch_packed=packed_sequence,
+                memory=memory,
+            )
 
         # --- Apply velocity masks ---
         # Zero out velocity for conditioned parts (they don't change during sampling)
@@ -3648,6 +3666,7 @@ class OmniMoTModel(ImaginaireModel):
             _align_device,
         )
 
+        nvtx_push("gen.pack_template")
         reuse_pack_templates = self._can_reuse_inference_pack_templates(sequence_plans, gen_data_clean)
         cond_packed_sequence_template: PackedSequence | None = None
         uncond_packed_sequence_template: PackedSequence | None = None
@@ -3691,6 +3710,7 @@ class OmniMoTModel(ImaginaireModel):
                 skip_text_tokens=False,
             )
             batched_packed_sequence_template.to_cuda()
+        nvtx_pop()  # gen.pack_template
 
         # Create a velocity function for a single sample (for use with self.sampler).
         # FSDP collective-sequence alignment (throughput-preset inference).
@@ -3742,25 +3762,26 @@ class OmniMoTModel(ImaginaireModel):
         # never permanently shadow another dispatch_attention_fn on the model.
         previous_attention_dispatch = None
         try:
-            if reuse_text_kv:
-                target_net = net or self.net
-                if target_net is None:
-                    raise RuntimeError(
-                        "Cannot install memory-aware attention dispatch: net is None "
-                        "(pass net= or ensure self.net is built)."
-                    )
-                previous_attention_dispatch = install_inference_memory_attention_dispatch(target_net)
-                # Cond cache covers no-CFG steps. When the fused path is eligible,
-                # CFG steps use ``batched_text_kv_cache`` only — skip allocating the
-                # unused uncond stack. Otherwise keep the sequential cond+uncond pair.
-                cond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
-                if batched_cfg_fast_path:
-                    # Shared und K/V for the fused cond+uncond (B=2) pack. Filled on
-                    # the first batched forward; later steps run gen-only with
-                    # per-sample isolation in ``_attention_gen_with_cached_text``.
-                    batched_text_kv_cache = self._make_inference_text_kv_cache(target_net)
-                elif guidance != 1.0 or velocity_postprocess_builder is not None:
-                    uncond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
+            with nvtx_phase("gen.text_kv"):
+                if reuse_text_kv:
+                    target_net = net or self.net
+                    if target_net is None:
+                        raise RuntimeError(
+                            "Cannot install memory-aware attention dispatch: net is None "
+                            "(pass net= or ensure self.net is built)."
+                        )
+                    previous_attention_dispatch = install_inference_memory_attention_dispatch(target_net)
+                    # Cond cache covers no-CFG steps. When the fused path is eligible,
+                    # CFG steps use ``batched_text_kv_cache`` only — skip allocating the
+                    # unused uncond stack. Otherwise keep the sequential cond+uncond pair.
+                    cond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
+                    if batched_cfg_fast_path:
+                        # Shared und K/V for the fused cond+uncond (B=2) pack. Filled on
+                        # the first batched forward; later steps run gen-only with
+                        # per-sample isolation in ``_attention_gen_with_cached_text``.
+                        batched_text_kv_cache = self._make_inference_text_kv_cache(target_net)
+                    elif guidance != 1.0 or velocity_postprocess_builder is not None:
+                        uncond_text_kv_cache = self._make_inference_text_kv_cache(target_net)
 
             def velocity_fn(noise_x: list[torch.Tensor], timestep: torch.Tensor) -> list[torch.Tensor]:
                 # len(noise_x) == B, noise_x[i] is shape (D)
@@ -3855,12 +3876,13 @@ class OmniMoTModel(ImaginaireModel):
                     uncond_v = velocities[n:]
                     if not needs_text_cfg:
                         return cond_v
-                    v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
-                    if normalize_cfg:
-                        v_pred = [
-                            v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
-                            for v_i, c_i in zip(v_pred, cond_v)
-                        ]
+                    with nvtx_phase("step.cfg_combine"):
+                        v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+                        if normalize_cfg:
+                            v_pred = [
+                                v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
+                                for v_i, c_i in zip(v_pred, cond_v)
+                            ]
                     return v_pred
 
                 # Fast path: only text-CFG and no postprocess — preserve the
@@ -3876,12 +3898,13 @@ class OmniMoTModel(ImaginaireModel):
                         # Peers needed CFG so we ran the uncond forward to keep
                         # FSDP allgather aligned; locally we still return cond.
                         return cond_v
-                    v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
-                    if normalize_cfg:
-                        v_pred = [
-                            v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
-                            for v_i, c_i in zip(v_pred, cond_v)
-                        ]
+                    with nvtx_phase("step.cfg_combine"):
+                        v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+                        if normalize_cfg:
+                            v_pred = [
+                                v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
+                                for v_i, c_i in zip(v_pred, cond_v)
+                            ]
                     return v_pred
 
                 # Conditional forward, then per-step postprocess hook. Hook runs
@@ -3900,13 +3923,14 @@ class OmniMoTModel(ImaginaireModel):
                     # Same alignment story as above for the postprocess branch.
                     return cond_v
 
-                v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
+                with nvtx_phase("step.cfg_combine"):
+                    v_pred = [u_i + guidance * (c_i - u_i) for c_i, u_i in zip(cond_v, uncond_v)]
 
-                if normalize_cfg:
-                    v_pred = [
-                        v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
-                        for v_i, c_i in zip(v_pred, cond_v)
-                    ]
+                    if normalize_cfg:
+                        v_pred = [
+                            v_i * (torch.norm(c_i) / (torch.norm(v_i) + 1e-8)).clamp(min=0.0, max=1.0)
+                            for v_i, c_i in zip(v_pred, cond_v)
+                        ]
 
                 return v_pred
 
@@ -4058,6 +4082,7 @@ class OmniMoTModel(ImaginaireModel):
             # and sound latents. Mirror the per-sample logic from _prepare_inference_data:
             # Order: [vision | lidar (if present) | action (if present) | sound (if present)]
             # lidar/action/sound lists are dense (only modality-having samples), so use separate indexes.
+            nvtx_push("gen.output_unsplit")
             result_vision: list[torch.Tensor] = []
             result_lidar: list[torch.Tensor] = []
             result_action: list[torch.Tensor] = []
@@ -4140,6 +4165,7 @@ class OmniMoTModel(ImaginaireModel):
                 result["action"] = result_action
             if self.config.sound_gen and len(result_sound) > 0:
                 result["sound"] = result_sound
+            nvtx_pop()  # gen.output_unsplit
             return result
         finally:
             if previous_attention_dispatch is not None:

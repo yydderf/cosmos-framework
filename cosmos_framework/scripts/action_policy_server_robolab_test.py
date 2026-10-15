@@ -165,3 +165,48 @@ def test_build_data_batch_wraps_multi_item_keys_like_internal_server() -> None:
     assert batch["domain_id"][0].shape == (1,)
     assert batch["conditioning_fps"][0].shape == (1,)
     assert batch["ai_caption"] == ["move"]
+
+
+def _record_nsys_calls(monkeypatch: pytest.MonkeyPatch, warmup: str, n_calls: int) -> list[int]:
+    """Run a decorated no-op ``n_calls`` times, returning the captured call indexes."""
+    monkeypatch.setenv("COSMOS_NSYS_WARMUP", warmup)
+    started: list[int] = []
+    sync_calls: list[int] = []
+    index = {"value": 0}
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: sync_calls.append(index["value"]))
+    monkeypatch.setattr(torch.cuda.profiler, "start", lambda: started.append(index["value"]))
+    monkeypatch.setattr(torch.cuda.profiler, "stop", lambda: None)
+
+    @robolab_server.nsys_profile
+    def _infer() -> int:
+        return index["value"]
+
+    for i in range(n_calls):
+        index["value"] = i
+        _infer()
+
+    # Every captured request syncs on both edges; uncaptured ones must not sync at all,
+    # since that cost would otherwise be paid on every request forever.
+    assert sync_calls == [i for i in started for _ in range(2)]
+    return started
+
+
+def test_nsys_profile_captures_only_warm_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two windows, matching --capture-range-end=repeat:2 in deploy/*/run_policy_server.sh.
+    assert _record_nsys_calls(monkeypatch, warmup="3", n_calls=10) == [3, 4]
+
+
+def test_nsys_profile_skips_capture_when_warmup_never_reached(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _record_nsys_calls(monkeypatch, warmup="100", n_calls=10) == []
+
+
+def test_nsys_profile_preserves_return_value_and_identity() -> None:
+    @robolab_server.nsys_profile
+    def _infer(value: int) -> int:
+        """Docstring kept by functools.wraps."""
+        return value * 2
+
+    assert _infer(21) == 42
+    assert _infer.__name__ == "_infer"
+    assert _infer.__doc__ is not None and "functools.wraps" in _infer.__doc__

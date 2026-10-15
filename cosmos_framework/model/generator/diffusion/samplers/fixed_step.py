@@ -17,6 +17,7 @@ from collections.abc import Callable
 import torch
 
 from cosmos_framework.model.generator.diffusion.samplers.utils import run_multiseed
+from cosmos_framework.utils.nvtx import nvtx_phase
 
 
 class FixedStepSampler:
@@ -110,7 +111,8 @@ class FixedStepSampler:
             if step_callback is not None:
                 step_callback(step_idx, num_steps_total)
             timestep = torch.tensor(sigma_cur * self.num_train_timesteps, device=device)
-            v_pred = velocity_fn(latent, timestep.reshape(1, 1))
+            with nvtx_phase("sampler.velocity"):
+                v_pred = velocity_fn(latent, timestep.reshape(1, 1))
 
             def _sde_step(
                 seed: int | None,
@@ -138,13 +140,14 @@ class FixedStepSampler:
                     latent_next = condition_mask * condition_reference + (1.0 - condition_mask) * latent_next  # [...,D]
                 return latent_next
 
-            latent = run_multiseed(
-                _sde_step,
-                seed=seed,
-                latent=latent,
-                v_pred=v_pred,
-                condition_reference=condition_reference,
-                condition_mask=condition_mask,
-            )
+            with nvtx_phase("sampler.scheduler_update"):
+                latent = run_multiseed(
+                    _sde_step,
+                    seed=seed,
+                    latent=latent,
+                    v_pred=v_pred,
+                    condition_reference=condition_reference,
+                    condition_mask=condition_mask,
+                )
 
         return latent
